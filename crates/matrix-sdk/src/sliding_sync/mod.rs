@@ -567,6 +567,9 @@ impl SlidingSync {
             self.generate_sync_request(&mut LazyTransactionId::new()).await?;
 
         debug!("Sending request");
+        debug!("request uri - {:?}", request.uri());
+        debug!("request method - {:?}", request.method());
+        debug!("request body - {:?}", request.body());
 
         // Prepare the request.
         let request = self.inner.client.send_with_homeserver(
@@ -612,6 +615,7 @@ impl SlidingSync {
 
                 // Wait on the sliding sync request success or failure early.
                 let response = request.await?;
+                debug!("Got response - {:?}", response);
 
                 // At this point, if `request` has been resolved successfully, we wait on
                 // `e2ee_uploads`. It did run concurrently, so it should not be blocking for too

@@ -173,13 +173,16 @@ impl HttpClient {
             request
         };
 
-        debug!("Sending request - {:?}", request.uri());
+        debug!("Sending request");
+        debug!("request uri - {:?}", uri);
+        debug!("request method - {:?}", method);
+        debug!("request body - {:?}", request.body());
 
         // There's a bunch of state in send_request, factor out a pinned inner
         // future to reduce this size of futures that await this function.
         match Box::pin(self.send_request::<R>(request, config, send_progress)).await {
             Ok(response) => {
-                debug!("Got response");
+                debug!("Got response: {:?}", response);
                 Ok(response)
             }
             Err(e) => {
