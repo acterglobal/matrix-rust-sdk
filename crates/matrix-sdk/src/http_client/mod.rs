@@ -173,7 +173,7 @@ impl HttpClient {
             request
         };
 
-        debug!("Sending request");
+        debug!("Sending request - {:?}", request.uri());
 
         // There's a bunch of state in send_request, factor out a pinned inner
         // future to reduce this size of futures that await this function.
