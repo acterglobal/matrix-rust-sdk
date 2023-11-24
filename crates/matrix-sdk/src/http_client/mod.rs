@@ -165,18 +165,19 @@ impl HttpClient {
             // it to do given a specific request body, it's useful to log the
             // request body here. This doesn't contain any personal information.
             // TODO: Remove this once sliding sync isn't experimental anymore.
+            let body = request.body();
             #[cfg(feature = "experimental-sliding-sync")]
             if type_name::<R>() == "ruma_client_api::sync::sync_events::v4::Request" {
-                span.record("request_body", debug(request.body()));
+                span.record("request_body", debug(body));
             }
-
+            debug!("request uri - {:?}", uri);
+            debug!("request method - {:?}", method);
+            debug!("request body - {:?}", body);
+    
             request
         };
 
         debug!("Sending request");
-        debug!("request uri - {:?}", uri);
-        debug!("request method - {:?}", method);
-        debug!("request body - {:?}", request.body());
 
         // There's a bunch of state in send_request, factor out a pinned inner
         // future to reduce this size of futures that await this function.
