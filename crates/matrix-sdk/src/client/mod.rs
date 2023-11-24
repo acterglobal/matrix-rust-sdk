@@ -1280,7 +1280,7 @@ impl Client {
 
         let access_token = self.access_token();
 
-        self.inner
+        let response = self.inner
             .http_client
             .send(
                 request,
@@ -1290,7 +1290,9 @@ impl Client {
                 self.server_versions().await?,
                 send_progress,
             )
-            .await
+            .await;
+        debug!("Got response - {:?}", response);
+        response
     }
 
     fn broadcast_unknown_token(&self, soft_logout: &bool) {
