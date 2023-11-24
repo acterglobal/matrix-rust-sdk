@@ -118,7 +118,7 @@ impl HttpClient {
     ) -> Result<R::IncomingResponse, HttpError>
     where
         R: OutgoingRequest + Debug,
-        HttpError: From<FromHttpResponseError<R::EndpointError>>, <R as OutgoingRequest>::IncomingResponse: Debug,
+        HttpError: From<FromHttpResponseError<R::EndpointError>>,
     {
         let config = match config {
             Some(config) => config,
@@ -183,7 +183,7 @@ impl HttpClient {
         // future to reduce this size of futures that await this function.
         match Box::pin(self.send_request::<R>(request, config, send_progress)).await {
             Ok(response) => {
-                debug!("Got response - {:?}", response);
+                debug!("Got response");
                 Ok(response)
             }
             Err(e) => {
