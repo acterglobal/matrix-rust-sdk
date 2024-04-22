@@ -39,7 +39,7 @@ futures-util = { version = "0.3.26", default-features = false, features = [
 http = "0.2.6"
 imbl = "2.0.0"
 itertools = "0.12.0"
-ruma = { git = "https://github.com/acterglobal/ruma", rev = "a02316c36a2eac042cf67ea9cad9db7bf27ac380", features = [
+ruma = { git = "https://github.com/acterglobal/ruma", rev = "6772c2869f673107adc7be5be3a07dec8d98cc2b", features = [
     "client-api-c",
     "compat-upload-signatures",
     "compat-user-id",
@@ -47,7 +47,7 @@ ruma = { git = "https://github.com/acterglobal/ruma", rev = "a02316c36a2eac042cf
     "compat-tag-info",
     "unstable-msc3401",
 ] }
-ruma-common = { git = "https://github.com/acterglobal/ruma", rev = "a02316c36a2eac042cf67ea9cad9db7bf27ac380" }
+ruma-common = { git = "https://github.com/acterglobal/ruma", rev = "6772c2869f673107adc7be5be3a07dec8d98cc2b" }
 once_cell = "1.16.0"
 rand = "0.8.5"
 serde = "1.0.151"
