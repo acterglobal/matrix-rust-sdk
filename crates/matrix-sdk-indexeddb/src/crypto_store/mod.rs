@@ -134,8 +134,8 @@ pub enum IndexeddbCryptoStoreError {
     CryptoStoreError(#[from] CryptoStoreError),
 }
 
-impl From<indexed_db_futures::web_sys::DomException> for IndexeddbCryptoStoreError {
-    fn from(frm: indexed_db_futures::web_sys::DomException) -> IndexeddbCryptoStoreError {
+impl From<web_sys::DomException> for IndexeddbCryptoStoreError {
+    fn from(frm: web_sys::DomException) -> IndexeddbCryptoStoreError {
         IndexeddbCryptoStoreError::DomException {
             name: frm.name(),
             message: frm.message(),
@@ -1272,6 +1272,12 @@ impl_crypto_store! {
                 Ok(true)
             }
         }
+    }
+
+    async fn clear_caches(&self) {
+        self.session_cache.clear()
+        // We don't need to clear `static_account` as it only contains immutable data
+        // therefore cannot get out of sync with the underlying store.
     }
 }
 

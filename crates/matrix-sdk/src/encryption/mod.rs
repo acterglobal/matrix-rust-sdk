@@ -161,6 +161,7 @@ pub struct EncryptionSettings {
 
 /// Settings for end-to-end encryption features.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum BackupDownloadStrategy {
     /// Automatically download all room keys from the backup when the backup
     /// recovery key has been received. The backup recovery key can be received
@@ -612,6 +613,12 @@ impl Encryption {
         self.client.olm_machine().await.as_ref().map(|o| o.identity_keys().ed25519.to_base64())
     }
 
+    /// Get the public curve25519 key of our own device in base64. This is
+    /// usually what is called the identity key of the device.
+    pub async fn curve25519_key(&self) -> Option<String> {
+        self.client.olm_machine().await.as_ref().map(|o| o.identity_keys().curve25519.to_base64())
+    }
+
     /// Get the status of the private cross signing keys.
     ///
     /// This can be used to check which private cross signing keys we have
@@ -818,7 +825,7 @@ impl Encryption {
     pub async fn get_user_identity(
         &self,
         user_id: &UserId,
-    ) -> Result<Option<crate::encryption::identities::UserIdentity>, CryptoStoreError> {
+    ) -> Result<Option<identities::UserIdentity>, CryptoStoreError> {
         use crate::encryption::identities::UserIdentity;
 
         let olm = self.client.olm_machine().await;
@@ -975,7 +982,7 @@ impl Encryption {
     /// identity in the first place.
     async fn ensure_initial_key_query(&self) -> Result<()> {
         let olm_machine = self.client.olm_machine().await;
-        let olm_machine = olm_machine.as_ref().ok_or(crate::Error::NoOlmMachine)?;
+        let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
         let user_id = olm_machine.user_id();
 
@@ -1038,7 +1045,7 @@ impl Encryption {
         auth_data: Option<AuthData>,
     ) -> Result<()> {
         let olm_machine = self.client.olm_machine().await;
-        let olm_machine = olm_machine.as_ref().ok_or(crate::Error::NoOlmMachine)?;
+        let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
         let user_id = olm_machine.user_id();
 
         self.ensure_initial_key_query().await?;

@@ -14,8 +14,9 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use matrix_sdk::room::power_levels::power_level_user_changes;
+use matrix_sdk::{crypto::types::events::UtdCause, room::power_levels::power_level_user_changes};
 use matrix_sdk_ui::timeline::{PollResult, TimelineDetails};
+use ruma::events::FullStateEventContent;
 use tracing::warn;
 
 use super::ProfileDetails;
@@ -47,6 +48,13 @@ impl TimelineItemContent {
             }
             Content::MembershipChange(membership) => TimelineItemContentKind::RoomMembership {
                 user_id: membership.user_id().to_string(),
+                user_display_name: if let FullStateEventContent::Original { content, .. } =
+                    membership.content()
+                {
+                    content.displayname.clone()
+                } else {
+                    None
+                },
                 change: membership.change().map(Into::into),
             },
             Content::ProfileChange(profile) => {
@@ -120,6 +128,7 @@ pub enum TimelineItemContentKind {
     },
     RoomMembership {
         user_id: String,
+        user_display_name: Option<String>,
         change: Option<MembershipChange>,
     },
     ProfileChange {
@@ -214,6 +223,10 @@ pub enum EncryptedMessage {
     MegolmV1AesSha2 {
         /// The ID of the session used to encrypt the message.
         session_id: String,
+
+        /// What we know about what caused this UTD. E.g. was this event sent
+        /// when we were not a member of this room?
+        cause: UtdCause,
     },
     Unknown,
 }
@@ -227,9 +240,9 @@ impl EncryptedMessage {
                 let sender_key = sender_key.clone();
                 Self::OlmV1Curve25519AesSha2 { sender_key }
             }
-            Message::MegolmV1AesSha2 { session_id, .. } => {
+            Message::MegolmV1AesSha2 { session_id, cause, .. } => {
                 let session_id = session_id.clone();
-                Self::MegolmV1AesSha2 { session_id }
+                Self::MegolmV1AesSha2 { session_id, cause: *cause }
             }
             Message::Unknown => Self::Unknown,
         }

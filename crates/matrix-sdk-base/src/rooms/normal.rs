@@ -40,7 +40,6 @@ use ruma::{
             history_visibility::HistoryVisibility,
             join_rules::JoinRule,
             member::{MembershipState, RoomMemberEventContent},
-            name::RoomNameEventContent,
             redaction::SyncRoomRedactionEvent,
             tombstone::RoomTombstoneEventContent,
         },
@@ -50,8 +49,8 @@ use ruma::{
     },
     room::RoomType,
     serde::Raw,
-    EventId, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedUserId, RoomAliasId,
-    RoomId, RoomVersionId, UserId,
+    EventId, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedUserId,
+    RoomAliasId, RoomId, RoomVersionId, UserId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -148,6 +147,14 @@ impl From<&MembershipState> for RoomState {
     }
 }
 
+/// The number of heroes chosen to compute a room's name, if the room didn't
+/// have a name set by the users themselves.
+///
+/// A server must return at most 5 heroes, according to the paragraph below
+/// https://spec.matrix.org/v1.10/client-server-api/#get_matrixclientv3sync (grep for "heroes"). We
+/// try to behave similarly here.
+const NUM_HEROES: usize = 5;
+
 impl Room {
     /// The size of the latest_encrypted_events RingBuffer
     // SAFETY: `new_unchecked` is safe because 10 is not zero.
@@ -203,6 +210,12 @@ impl Room {
     /// Whether this room's [`RoomType`] is `m.space`.
     pub fn is_space(&self) -> bool {
         self.inner.read().room_type().is_some_and(|t| *t == RoomType::Space)
+    }
+
+    /// Returns the room's type as defined in its creation event
+    /// (`m.room.create`).
+    pub fn room_type(&self) -> Option<RoomType> {
+        self.inner.read().room_type().map(ToOwned::to_owned)
     }
 
     /// Get the unread notification counts.
@@ -287,12 +300,7 @@ impl Room {
 
     /// Get the avatar url of this room.
     pub fn avatar_url(&self) -> Option<OwnedMxcUri> {
-        self.inner
-            .read()
-            .base_info
-            .avatar
-            .as_ref()
-            .and_then(|e| e.as_original().and_then(|e| e.content.url.clone()))
+        self.inner.read().avatar_url().map(ToOwned::to_owned)
     }
 
     /// Get the canonical alias of this room.
@@ -322,12 +330,15 @@ impl Room {
     }
 
     /// Is this room considered a direct message.
+    ///
+    /// Async because it can read room info from storage.
     #[instrument(skip_all, fields(room_id = ?self.room_id))]
     pub async fn is_direct(&self) -> StoreResult<bool> {
         match self.state() {
             RoomState::Joined | RoomState::Left => {
                 Ok(!self.inner.read().base_info.dm_targets.is_empty())
             }
+
             RoomState::Invited => {
                 let member = self.get_member(self.own_user_id()).await?;
 
@@ -409,7 +420,8 @@ impl Room {
 
     /// Get the `m.room.name` of this room.
     ///
-    /// The returned string is guaranteed not to be empty.
+    /// The returned string may be empty if the event has been redacted, or it's
+    /// missing from storage.
     pub fn name(&self) -> Option<String> {
         self.inner.read().name().map(ToOwned::to_owned)
     }
@@ -454,7 +466,7 @@ impl Room {
     /// The display name is calculated according to [this algorithm][spec].
     ///
     /// [spec]: <https://matrix.org/docs/spec/client_server/latest#calculating-the-display-name-for-a-room>
-    pub async fn display_name(&self) -> StoreResult<DisplayName> {
+    pub async fn computed_display_name(&self) -> StoreResult<DisplayName> {
         self.calculate_name().await
     }
 
@@ -591,63 +603,87 @@ impl Room {
                 let name = name.trim();
                 return Ok(DisplayName::Named(name.to_owned()));
             }
+
             if let Some(alias) = inner.canonical_alias() {
                 let alias = alias.alias().trim();
                 return Ok(DisplayName::Aliased(alias.to_owned()));
             }
+
             inner.summary.clone()
         };
 
-        let is_own_member = |m: &RoomMember| m.user_id() == &*self.own_user_id;
-        let is_own_user_id = |u: &str| u == self.own_user_id().as_str();
+        let own_user_id = self.own_user_id().as_str();
 
-        let members: Vec<RoomMember> = if summary.heroes.is_empty() {
-            self.members(RoomMemberships::ACTIVE)
-                .await?
-                .into_iter()
-                .filter(|u| !is_own_member(u))
-                .take(5)
-                .collect()
+        let (heroes, guessed_num_members): (Vec<RoomMember>, _) = if summary.heroes.is_empty() {
+            let mut members = self.members(RoomMemberships::ACTIVE).await?;
+
+            // Make the ordering deterministic.
+            members.sort_unstable_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
+
+            // We can make a good prediction of the total number of members here. This might
+            // be incorrect if the database info is outdated.
+            let guessed_num_members = Some(members.len());
+
+            (
+                members
+                    .into_iter()
+                    .take(NUM_HEROES)
+                    .filter(|u| u.user_id() != own_user_id)
+                    .collect(),
+                guessed_num_members,
+            )
         } else {
-            let members: Vec<_> =
-                stream::iter(summary.heroes.iter().filter(|u| !is_own_user_id(u)))
-                    .filter_map(|u| async move {
-                        let user_id = UserId::parse(u.as_str()).ok()?;
-                        self.get_member(&user_id).await.transpose()
-                    })
-                    .collect()
-                    .await;
+            let mut heroes = summary.heroes;
+
+            // Make the ordering deterministic.
+            heroes.sort_unstable();
+
+            let members: Vec<_> = stream::iter(heroes.iter())
+                .filter_map(|u| async move {
+                    let user_id = UserId::parse(u.as_str()).ok()?;
+                    if user_id == own_user_id {
+                        return None;
+                    }
+                    self.get_member(&user_id).await.transpose()
+                })
+                .collect()
+                .await;
 
             let members: StoreResult<Vec<_>> = members.into_iter().collect();
 
-            members?
+            (members?, None)
         };
 
-        let (joined, invited) = match self.state() {
+        let (num_joined, num_invited) = match self.state() {
             RoomState::Invited => {
                 // when we were invited we don't have a proper summary, we have to do best
                 // guessing
-                (members.len() as u64, 1u64)
+                (heroes.len() as u64, 1u64)
             }
+
             RoomState::Joined if summary.joined_member_count == 0 => {
+                let num_members = if let Some(guessed_num_members) = guessed_num_members {
+                    guessed_num_members
+                } else {
+                    self.members(RoomMemberships::ACTIVE).await?.len()
+                };
+
                 // joined but the summary is not completed yet
-                (
-                    (members.len() as u64) + 1, // we've taken ourselves out of the count
-                    summary.invited_member_count,
-                )
+                (num_members as u64, summary.invited_member_count)
             }
+
             _ => (summary.joined_member_count, summary.invited_member_count),
         };
 
         debug!(
             room_id = ?self.room_id(),
             own_user = ?self.own_user_id,
-            joined, invited,
-            heroes = ?members,
+            num_joined, num_invited,
+            heroes = ?heroes,
             "Calculating name for a room",
         );
 
-        Ok(self.inner.read().base_info.calculate_room_name(joined, invited, members))
+        Ok(self.inner.read().base_info.calculate_room_name(num_joined, num_invited, heroes))
     }
 
     /// Subscribe to the inner `RoomInfo`.
@@ -678,6 +714,8 @@ impl Room {
     /// Returns `None` if the member was never part of this room, otherwise
     /// return a `RoomMember` that can be in a joined, invited, left, banned
     /// state.
+    ///
+    /// Async because it can read from storage.
     pub async fn get_member(&self, user_id: &UserId) -> StoreResult<Option<RoomMember>> {
         let Some(raw_event) = self.store.get_member_event(self.room_id(), user_id).await? else {
             debug!(%user_id, "Member event not found in state store");
@@ -698,6 +736,8 @@ impl Room {
     }
 
     /// The current `MemberRoomInfo` for this room.
+    ///
+    /// Async because it can read from storage.
     async fn member_room_info<'a>(
         &self,
         display_names: &'a [String],
@@ -1011,15 +1051,15 @@ impl RoomInfo {
         self.base_info.handle_redaction(redacts);
     }
 
-    /// Update the room name
-    pub fn update_name(&mut self, name: String) {
-        self.base_info.name = Some(MinimalStateEvent::Original(OriginalMinimalStateEvent {
-            content: RoomNameEventContent::new(name),
-            event_id: None,
-        }));
+    /// Returns the current room avatar.
+    pub fn avatar_url(&self) -> Option<&MxcUri> {
+        self.base_info
+            .avatar
+            .as_ref()
+            .and_then(|e| e.as_original().and_then(|e| e.content.url.as_deref()))
     }
 
-    /// Update the room avatar
+    /// Update the room avatar.
     pub fn update_avatar(&mut self, url: Option<OwnedMxcUri>) {
         self.base_info.avatar = url.map(|url| {
             let mut content = RoomAvatarEventContent::new();
@@ -1029,12 +1069,12 @@ impl RoomInfo {
         });
     }
 
-    /// Update the notifications count
+    /// Update the notifications count.
     pub fn update_notification_count(&mut self, notification_counts: UnreadNotificationsCount) {
         self.notification_counts = notification_counts;
     }
 
-    /// Update the RoomSummary
+    /// Update the RoomSummary.
     ///
     /// Returns true if the Summary modified the info, false otherwise.
     pub fn update_summary(&mut self, summary: &RumaSummary) -> bool {
@@ -1145,14 +1185,20 @@ impl RoomInfo {
         }
     }
 
-    fn history_visibility(&self) -> &HistoryVisibility {
+    /// Returns the history visibility for this room.
+    ///
+    /// Defaults to `WorldReadable`, if missing.
+    pub fn history_visibility(&self) -> &HistoryVisibility {
         match &self.base_info.history_visibility {
             Some(MinimalStateEvent::Original(ev)) => &ev.content.history_visibility,
             _ => &HistoryVisibility::WorldReadable,
         }
     }
 
-    fn join_rule(&self) -> &JoinRule {
+    /// Returns the join rule for this room.
+    ///
+    /// Defaults to `Public`, if missing.
+    pub fn join_rule(&self) -> &JoinRule {
         match &self.base_info.join_rules {
             Some(MinimalStateEvent::Original(ev)) => &ev.content.join_rule,
             _ => &JoinRule::Public,
@@ -1169,7 +1215,8 @@ impl RoomInfo {
         Some(&self.base_info.tombstone.as_ref()?.as_original()?.content)
     }
 
-    fn topic(&self) -> Option<&str> {
+    /// Returns the topic for this room, if set.
+    pub fn topic(&self) -> Option<&str> {
         Some(&self.base_info.topic.as_ref()?.as_original()?.content.topic)
     }
 
@@ -1697,7 +1744,7 @@ mod tests {
     #[async_test]
     async fn test_display_name_for_joined_room_is_empty_if_no_info() {
         let (_, room) = make_room(RoomState::Joined);
-        assert_eq!(room.display_name().await.unwrap(), DisplayName::Empty);
+        assert_eq!(room.computed_display_name().await.unwrap(), DisplayName::Empty);
     }
 
     #[async_test]
@@ -1705,7 +1752,10 @@ mod tests {
         let (_, room) = make_room(RoomState::Joined);
         room.inner
             .update(|info| info.base_info.canonical_alias = Some(make_canonical_alias_event()));
-        assert_eq!(room.display_name().await.unwrap(), DisplayName::Aliased("test".to_owned()));
+        assert_eq!(
+            room.computed_display_name().await.unwrap(),
+            DisplayName::Aliased("test".to_owned())
+        );
     }
 
     #[async_test]
@@ -1713,16 +1763,22 @@ mod tests {
         let (_, room) = make_room(RoomState::Joined);
         room.inner
             .update(|info| info.base_info.canonical_alias = Some(make_canonical_alias_event()));
-        assert_eq!(room.display_name().await.unwrap(), DisplayName::Aliased("test".to_owned()));
+        assert_eq!(
+            room.computed_display_name().await.unwrap(),
+            DisplayName::Aliased("test".to_owned())
+        );
         room.inner.update(|info| info.base_info.name = Some(make_name_event()));
         // Display name wasn't cached when we asked for it above, and name overrides
-        assert_eq!(room.display_name().await.unwrap(), DisplayName::Named("Test Room".to_owned()));
+        assert_eq!(
+            room.computed_display_name().await.unwrap(),
+            DisplayName::Named("Test Room".to_owned())
+        );
     }
 
     #[async_test]
     async fn test_display_name_for_invited_room_is_empty_if_no_info() {
         let (_, room) = make_room(RoomState::Invited);
-        assert_eq!(room.display_name().await.unwrap(), DisplayName::Empty);
+        assert_eq!(room.computed_display_name().await.unwrap(), DisplayName::Empty);
     }
 
     #[async_test]
@@ -1735,7 +1791,7 @@ mod tests {
         });
         room.inner.update(|info| info.base_info.name = Some(room_name));
 
-        assert_eq!(room.display_name().await.unwrap(), DisplayName::Empty);
+        assert_eq!(room.computed_display_name().await.unwrap(), DisplayName::Empty);
     }
 
     #[async_test]
@@ -1743,7 +1799,10 @@ mod tests {
         let (_, room) = make_room(RoomState::Invited);
         room.inner
             .update(|info| info.base_info.canonical_alias = Some(make_canonical_alias_event()));
-        assert_eq!(room.display_name().await.unwrap(), DisplayName::Aliased("test".to_owned()));
+        assert_eq!(
+            room.computed_display_name().await.unwrap(),
+            DisplayName::Aliased("test".to_owned())
+        );
     }
 
     #[async_test]
@@ -1751,10 +1810,16 @@ mod tests {
         let (_, room) = make_room(RoomState::Invited);
         room.inner
             .update(|info| info.base_info.canonical_alias = Some(make_canonical_alias_event()));
-        assert_eq!(room.display_name().await.unwrap(), DisplayName::Aliased("test".to_owned()));
+        assert_eq!(
+            room.computed_display_name().await.unwrap(),
+            DisplayName::Aliased("test".to_owned())
+        );
         room.inner.update(|info| info.base_info.name = Some(make_name_event()));
         // Display name wasn't cached when we asked for it above, and name overrides
-        assert_eq!(room.display_name().await.unwrap(), DisplayName::Named("Test Room".to_owned()));
+        assert_eq!(
+            room.computed_display_name().await.unwrap(),
+            DisplayName::Named("Test Room".to_owned())
+        );
     }
 
     fn make_canonical_alias_event() -> MinimalStateEvent<RoomCanonicalAliasEventContent> {
@@ -1794,7 +1859,7 @@ mod tests {
 
         room.inner.update_if(|info| info.update_summary(&summary));
         assert_eq!(
-            room.display_name().await.unwrap(),
+            room.computed_display_name().await.unwrap(),
             DisplayName::Calculated("Matthew".to_owned())
         );
     }
@@ -1816,7 +1881,7 @@ mod tests {
         store.save_changes(&changes).await.unwrap();
 
         assert_eq!(
-            room.display_name().await.unwrap(),
+            room.computed_display_name().await.unwrap(),
             DisplayName::Calculated("Matthew".to_owned())
         );
     }
@@ -1846,7 +1911,7 @@ mod tests {
 
         room.inner.update_if(|info| info.update_summary(&summary));
         assert_eq!(
-            room.display_name().await.unwrap(),
+            room.computed_display_name().await.unwrap(),
             DisplayName::Calculated("Matthew".to_owned())
         );
     }
@@ -1871,8 +1936,112 @@ mod tests {
         store.save_changes(&changes).await.unwrap();
 
         assert_eq!(
-            room.display_name().await.unwrap(),
+            room.computed_display_name().await.unwrap(),
             DisplayName::Calculated("Matthew".to_owned())
+        );
+    }
+
+    #[async_test]
+    async fn test_display_name_deterministic() {
+        let (store, room) = make_room(RoomState::Joined);
+
+        let alice = user_id!("@alice:example.org");
+        let bob = user_id!("@bob:example.org");
+        let carol = user_id!("@carol:example.org");
+        let denis = user_id!("@denis:example.org");
+        let erica = user_id!("@erica:example.org");
+        let fred = user_id!("@fred:example.org");
+        let me = user_id!("@me:example.org");
+
+        let mut changes = StateChanges::new("".to_owned());
+
+        // Save members in two batches, so that there's no implied ordering in the
+        // store.
+        {
+            let members = changes
+                .state
+                .entry(room.room_id().to_owned())
+                .or_default()
+                .entry(StateEventType::RoomMember)
+                .or_default();
+            members.insert(carol.into(), make_member_event(carol, "Carol").cast());
+            members.insert(bob.into(), make_member_event(bob, "Bob").cast());
+            members.insert(fred.into(), make_member_event(fred, "Fred").cast());
+            members.insert(me.into(), make_member_event(me, "Me").cast());
+            store.save_changes(&changes).await.unwrap();
+        }
+
+        {
+            let members = changes
+                .state
+                .entry(room.room_id().to_owned())
+                .or_default()
+                .entry(StateEventType::RoomMember)
+                .or_default();
+            members.insert(alice.into(), make_member_event(alice, "Alice").cast());
+            members.insert(erica.into(), make_member_event(erica, "Erica").cast());
+            members.insert(denis.into(), make_member_event(denis, "Denis").cast());
+            store.save_changes(&changes).await.unwrap();
+        }
+
+        let summary = assign!(RumaSummary::new(), {
+            joined_member_count: Some(7u32.into()),
+            heroes: vec![denis.to_string(), carol.to_string(), bob.to_string(), erica.to_string()],
+        });
+        room.inner.update_if(|info| info.update_summary(&summary));
+
+        assert_eq!(
+            room.computed_display_name().await.unwrap(),
+            DisplayName::Calculated("Bob, Carol, Denis, Erica, and 3 others".to_owned())
+        );
+    }
+
+    #[async_test]
+    async fn test_display_name_deterministic_no_heroes() {
+        let (store, room) = make_room(RoomState::Joined);
+
+        let alice = user_id!("@alice:example.org");
+        let bob = user_id!("@bob:example.org");
+        let carol = user_id!("@carol:example.org");
+        let denis = user_id!("@denis:example.org");
+        let erica = user_id!("@erica:example.org");
+        let fred = user_id!("@fred:example.org");
+        let me = user_id!("@me:example.org");
+
+        let mut changes = StateChanges::new("".to_owned());
+
+        // Save members in two batches, so that there's no implied ordering in the
+        // store.
+        {
+            let members = changes
+                .state
+                .entry(room.room_id().to_owned())
+                .or_default()
+                .entry(StateEventType::RoomMember)
+                .or_default();
+            members.insert(carol.into(), make_member_event(carol, "Carol").cast());
+            members.insert(bob.into(), make_member_event(bob, "Bob").cast());
+            members.insert(fred.into(), make_member_event(fred, "Fred").cast());
+            members.insert(me.into(), make_member_event(me, "Me").cast());
+            store.save_changes(&changes).await.unwrap();
+        }
+
+        {
+            let members = changes
+                .state
+                .entry(room.room_id().to_owned())
+                .or_default()
+                .entry(StateEventType::RoomMember)
+                .or_default();
+            members.insert(alice.into(), make_member_event(alice, "Alice").cast());
+            members.insert(erica.into(), make_member_event(erica, "Erica").cast());
+            members.insert(denis.into(), make_member_event(denis, "Denis").cast());
+            store.save_changes(&changes).await.unwrap();
+        }
+
+        assert_eq!(
+            room.computed_display_name().await.unwrap(),
+            DisplayName::Calculated("Alice, Bob, Carol, Denis, Erica, and 2 others".to_owned())
         );
     }
 
@@ -1900,24 +2069,9 @@ mod tests {
         store.save_changes(&changes).await.unwrap();
 
         room.inner.update_if(|info| info.update_summary(&summary));
-        assert_eq!(room.display_name().await.unwrap(), DisplayName::EmptyWas("Matthew".to_owned()));
-    }
-
-    #[test]
-    fn test_setting_the_name_on_room_info_creates_a_fake_event() {
-        // Given a room
-        let mut room_info = RoomInfo::new(room_id!("!r:e.uk"), RoomState::Joined);
-
-        // When I update its name
-        room_info.update_name("new name".to_owned());
-
-        // Then it reports the name I provided
-        assert_eq!(room_info.name(), Some("new name"));
-
-        // And that is implemented by making a fake event
         assert_eq!(
-            room_info.base_info.name.as_ref().unwrap().as_original().unwrap().content.name,
-            "new name"
+            room.computed_display_name().await.unwrap(),
+            DisplayName::EmptyWas("Matthew".to_owned())
         );
     }
 

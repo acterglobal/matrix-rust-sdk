@@ -17,12 +17,15 @@ use std::{collections::HashMap, fmt::Write as _, fs, sync::Arc};
 use anyhow::{Context, Result};
 use as_variant::as_variant;
 use eyeball_im::VectorDiff;
-use futures_util::{pin_mut, StreamExt};
-use matrix_sdk::attachment::{
-    AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
-    BaseThumbnailInfo, BaseVideoInfo, Thumbnail,
+use futures_util::{pin_mut, StreamExt as _};
+use matrix_sdk::{
+    attachment::{
+        AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
+        BaseThumbnailInfo, BaseVideoInfo, Thumbnail,
+    },
+    event_cache::paginator::PaginatorState,
 };
-use matrix_sdk_ui::timeline::{BackPaginationStatus, EventItemOrigin, Profile, TimelineDetails};
+use matrix_sdk_ui::timeline::{EventItemOrigin, Profile, TimelineDetails};
 use mime::Mime;
 use ruma::{
     events::{
@@ -162,13 +165,13 @@ impl Timeline {
 
     pub fn subscribe_to_back_pagination_status(
         &self,
-        listener: Box<dyn BackPaginationStatusListener>,
+        listener: Box<dyn PaginationStatusListener>,
     ) -> Result<Arc<TaskHandle>, ClientError> {
-        let mut subscriber = self.inner.back_pagination_status();
+        let (initial, mut subscriber) = self.inner.back_pagination_status();
 
         Ok(Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
             // Send the current state even if it hasn't changed right away.
-            listener.on_update(subscriber.next_now());
+            listener.on_update(initial);
 
             while let Some(status) = subscriber.next().await {
                 listener.on_update(status);
@@ -176,26 +179,30 @@ impl Timeline {
         }))))
     }
 
-    /// Loads older messages into the timeline.
+    /// Paginate backwards, whether we are in focused mode or in live mode.
     ///
-    /// Raises an exception if there are no timeline listeners.
-    pub fn paginate_backwards(&self, opts: PaginationOptions) -> Result<(), ClientError> {
-        RUNTIME.block_on(async { Ok(self.inner.paginate_backwards(opts.into()).await?) })
+    /// Returns whether we hit the end of the timeline or not.
+    pub async fn paginate_backwards(&self, num_events: u16) -> Result<bool, ClientError> {
+        Ok(self.inner.paginate_backwards(num_events).await?)
     }
 
-    pub fn send_read_receipt(
+    /// Paginate forwards, when in focused mode.
+    ///
+    /// Returns whether we hit the end of the timeline or not.
+    pub async fn focused_paginate_forwards(&self, num_events: u16) -> Result<bool, ClientError> {
+        Ok(self.inner.focused_paginate_forwards(num_events).await?)
+    }
+
+    pub async fn send_read_receipt(
         &self,
         receipt_type: ReceiptType,
         event_id: String,
     ) -> Result<(), ClientError> {
         let event_id = EventId::parse(event_id)?;
-
-        RUNTIME.block_on(async {
-            self.inner
-                .send_single_receipt(receipt_type.into(), ReceiptThread::Unthreaded, event_id)
-                .await?;
-            Ok(())
-        })
+        self.inner
+            .send_single_receipt(receipt_type.into(), ReceiptThread::Unthreaded, event_id)
+            .await?;
+        Ok(())
     }
 
     /// Mark the room as read by trying to attach an *unthreaded* read receipt
@@ -422,29 +429,27 @@ impl Timeline {
         Ok(())
     }
 
-    pub fn send_reply(
+    pub async fn send_reply(
         &self,
         msg: Arc<RoomMessageEventContentWithoutRelation>,
         reply_item: Arc<EventTimelineItem>,
     ) -> Result<(), ClientError> {
-        RUNTIME.block_on(async {
-            self.inner.send_reply((*msg).clone(), &reply_item.0, ForwardThread::Yes).await?;
-            anyhow::Ok(())
-        })?;
-
+        self.inner
+            .send_reply((*msg).clone(), &reply_item.0, ForwardThread::Yes)
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
         Ok(())
     }
 
-    pub fn edit(
+    pub async fn edit(
         &self,
         new_content: Arc<RoomMessageEventContentWithoutRelation>,
         edit_item: Arc<EventTimelineItem>,
     ) -> Result<(), ClientError> {
-        RUNTIME.block_on(async {
-            self.inner.edit((*new_content).clone().with_relation(None), &edit_item.0).await?;
-            anyhow::Ok(())
-        })?;
-
+        self.inner
+            .edit((*new_content).clone(), &edit_item.0)
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
         Ok(())
     }
 
@@ -457,14 +462,10 @@ impl Timeline {
         edit_item: Arc<EventTimelineItem>,
     ) -> Result<(), ClientError> {
         let poll_data = PollData { question, answers, max_selections, poll_kind };
-
-        RUNTIME.block_on(async {
-            self.inner
-                .edit_poll(poll_data.fallback_text(), poll_data.try_into()?, &edit_item.0)
-                .await?;
-            anyhow::Ok(())
-        })?;
-
+        self.inner
+            .edit_poll(poll_data.fallback_text(), poll_data.try_into()?, &edit_item.0)
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
         Ok(())
     }
 
@@ -495,20 +496,16 @@ impl Timeline {
         self.send(Arc::new(room_message_event_content))
     }
 
-    pub fn toggle_reaction(&self, event_id: String, key: String) -> Result<(), ClientError> {
+    pub async fn toggle_reaction(&self, event_id: String, key: String) -> Result<(), ClientError> {
         let event_id = EventId::parse(event_id)?;
-        RUNTIME.block_on(async {
-            self.inner.toggle_reaction(&Annotation::new(event_id, key)).await?;
-            Ok(())
-        })
+        self.inner.toggle_reaction(&Annotation::new(event_id, key)).await?;
+        Ok(())
     }
 
-    pub fn fetch_details_for_event(&self, event_id: String) -> Result<(), ClientError> {
+    pub async fn fetch_details_for_event(&self, event_id: String) -> Result<(), ClientError> {
         let event_id = <&EventId>::try_from(event_id.as_str())?;
-        RUNTIME.block_on(async {
-            self.inner.fetch_details_for_event(event_id).await.context("Fetching event details")?;
-            Ok(())
-        })
+        self.inner.fetch_details_for_event(event_id).await.context("Fetching event details")?;
+        Ok(())
     }
 
     pub fn retry_send(self: Arc<Self>, txn_id: String) {
@@ -527,43 +524,39 @@ impl Timeline {
         });
     }
 
-    pub fn get_event_timeline_item_by_event_id(
+    pub async fn get_event_timeline_item_by_event_id(
         &self,
         event_id: String,
     ) -> Result<Arc<EventTimelineItem>, ClientError> {
         let event_id = EventId::parse(event_id)?;
-        RUNTIME.block_on(async {
-            let item = self
-                .inner
-                .item_by_event_id(&event_id)
-                .await
-                .context("Item with given event ID not found")?;
-
-            Ok(Arc::new(EventTimelineItem(item)))
-        })
+        let item = self
+            .inner
+            .item_by_event_id(&event_id)
+            .await
+            .context("Item with given event ID not found")?;
+        Ok(Arc::new(EventTimelineItem(item)))
     }
 
-    pub fn get_timeline_event_content_by_event_id(
+    pub async fn get_timeline_event_content_by_event_id(
         &self,
         event_id: String,
     ) -> Result<Arc<RoomMessageEventContentWithoutRelation>, ClientError> {
         let event_id = EventId::parse(event_id)?;
-        RUNTIME.block_on(async {
-            let item = self
-                .inner
-                .item_by_event_id(&event_id)
-                .await
-                .context("Item with given event ID not found")?;
 
-            let msgtype = item
-                .content()
-                .as_message()
-                .context("Item with given event ID is not a message")?
-                .msgtype()
-                .to_owned();
+        let item = self
+            .inner
+            .item_by_event_id(&event_id)
+            .await
+            .context("Item with given event ID not found")?;
 
-            Ok(Arc::new(RoomMessageEventContentWithoutRelation::new(msgtype)))
-        })
+        let msgtype = item
+            .content()
+            .as_message()
+            .context("Item with given event ID is not a message")?
+            .msgtype()
+            .to_owned();
+
+        Ok(Arc::new(RoomMessageEventContentWithoutRelation::new(msgtype)))
     }
 
     pub async fn latest_event(&self) -> Option<Arc<EventTimelineItem>> {
@@ -571,6 +564,18 @@ impl Timeline {
 
         latest_event.map(|item| Arc::new(EventTimelineItem(item)))
     }
+}
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum FocusEventError {
+    #[error("the event id parameter {event_id} is incorrect: {err}")]
+    InvalidEventId { event_id: String, err: String },
+
+    #[error("the event {event_id} could not be found")]
+    EventNotFound { event_id: String },
+
+    #[error("error when trying to focus on an event: {msg}")]
+    Other { msg: String },
 }
 
 #[derive(uniffi::Record)]
@@ -585,8 +590,8 @@ pub trait TimelineListener: Sync + Send {
 }
 
 #[uniffi::export(callback_interface)]
-pub trait BackPaginationStatusListener: Sync + Send {
-    fn on_update(&self, status: BackPaginationStatus);
+pub trait PaginationStatusListener: Sync + Send {
+    fn on_update(&self, status: PaginatorState);
 }
 
 #[derive(Clone, uniffi::Object)]
@@ -746,8 +751,8 @@ impl TimelineItem {
         }
     }
 
-    pub fn unique_id(&self) -> u64 {
-        self.0.unique_id()
+    pub fn unique_id(&self) -> String {
+        self.0.unique_id().to_owned()
     }
 
     pub fn fmt_debug(&self) -> String {
@@ -973,32 +978,6 @@ impl SendAttachmentJoinHandle {
 
     pub fn cancel(&self) {
         self.abort_hdl.abort();
-    }
-}
-
-#[derive(uniffi::Enum)]
-pub enum PaginationOptions {
-    SimpleRequest { event_limit: u16, wait_for_token: bool },
-    UntilNumItems { event_limit: u16, items: u16, wait_for_token: bool },
-}
-
-impl From<PaginationOptions> for matrix_sdk_ui::timeline::PaginationOptions<'static> {
-    fn from(value: PaginationOptions) -> Self {
-        use matrix_sdk_ui::timeline::PaginationOptions as Opts;
-        let (wait_for_token, mut opts) = match value {
-            PaginationOptions::SimpleRequest { event_limit, wait_for_token } => {
-                (wait_for_token, Opts::simple_request(event_limit))
-            }
-            PaginationOptions::UntilNumItems { event_limit, items, wait_for_token } => {
-                (wait_for_token, Opts::until_num_items(event_limit, items))
-            }
-        };
-
-        if wait_for_token {
-            opts = opts.wait_for_token();
-        }
-
-        opts
     }
 }
 

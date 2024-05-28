@@ -15,7 +15,7 @@
 use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use futures_util::pin_mut;
-use matrix_sdk::Client;
+use matrix_sdk::{crypto::types::events::UtdCause, Client};
 use matrix_sdk_ui::{
     sync_service::{
         State as MatrixSyncServiceState, SyncService as MatrixSyncService,
@@ -106,15 +106,6 @@ impl SyncServiceBuilder {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl SyncServiceBuilder {
-    pub fn with_unified_invites_in_room_list(
-        self: Arc<Self>,
-        with_unified_invites: bool,
-    ) -> Arc<Self> {
-        let this = unwrap_or_clone_arc(self);
-        let builder = this.builder.with_unified_invites_in_room_list(with_unified_invites);
-        Arc::new(Self { builder, utd_hook: this.utd_hook })
-    }
-
     pub fn with_cross_process_lock(self: Arc<Self>, app_identifier: Option<String>) -> Arc<Self> {
         let this = unwrap_or_clone_arc(self);
         let builder = this.builder.with_cross_process_lock(app_identifier);
@@ -187,6 +178,10 @@ pub struct UnableToDecryptInfo {
     ///
     /// If set, this is in milliseconds.
     pub time_to_decrypt_ms: Option<u64>,
+
+    /// What we know about what caused this UTD. E.g. was this event sent when
+    /// we were not a member of this room?
+    pub cause: UtdCause,
 }
 
 impl From<SdkUnableToDecryptInfo> for UnableToDecryptInfo {
@@ -194,6 +189,7 @@ impl From<SdkUnableToDecryptInfo> for UnableToDecryptInfo {
         Self {
             event_id: value.event_id.to_string(),
             time_to_decrypt_ms: value.time_to_decrypt.map(|ttd| ttd.as_millis() as u64),
+            cause: value.cause,
         }
     }
 }

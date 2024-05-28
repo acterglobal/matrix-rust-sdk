@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use matrix_sdk::{
+    event_cache::paginator::PaginatorError,
     room::{power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole},
     RoomMemberships, RoomState,
 };
-use matrix_sdk_ui::timeline::RoomExt;
+use matrix_sdk_ui::timeline::{PaginationError, RoomExt, TimelineFocus};
 use mime::Mime;
 use ruma::{
     api::client::room::report_content,
@@ -17,7 +18,7 @@ use ruma::{
         },
         TimelineEventType,
     },
-    EventId, Int, UserId,
+    EventId, Int, RoomAliasId, UserId,
 };
 use tokio::sync::RwLock;
 use tracing::error;
@@ -30,7 +31,7 @@ use crate::{
     room_info::RoomInfo,
     room_member::RoomMember,
     ruma::ImageInfo,
-    timeline::{EventTimelineItem, ReceiptType, Timeline},
+    timeline::{EventTimelineItem, FocusEventError, ReceiptType, Timeline},
     utils::u64_to_uint,
     TaskHandle,
 };
@@ -76,7 +77,15 @@ impl Room {
         self.inner.room_id().to_string()
     }
 
-    pub fn name(&self) -> Option<String> {
+    /// Returns the room's name from the state event if available, otherwise
+    /// compute a room name based on the room's nature (DM or not) and number of
+    /// members.
+    pub fn display_name(&self) -> Result<String, ClientError> {
+        Ok(RUNTIME.block_on(self.inner.computed_display_name())?.to_string())
+    }
+
+    /// The raw name as present in the room state event.
+    pub fn raw_name(&self) -> Option<String> {
         self.inner.name()
     }
 
@@ -89,7 +98,7 @@ impl Room {
     }
 
     pub fn is_direct(&self) -> bool {
-        RUNTIME.block_on(async move { self.inner.is_direct().await.unwrap_or(false) })
+        RUNTIME.block_on(self.inner.is_direct()).unwrap_or(false)
     }
 
     pub fn is_public(&self) -> bool {
@@ -134,11 +143,11 @@ impl Room {
         self.inner.active_room_call_participants().iter().map(|u| u.to_string()).collect()
     }
 
-    pub fn inviter(&self) -> Option<RoomMember> {
+    /// For rooms one is invited to, retrieves the room member information for
+    /// the user who invited the logged-in user to a room.
+    pub async fn inviter(&self) -> Option<RoomMember> {
         if self.inner.state() == RoomState::Invited {
-            RUNTIME.block_on(async move {
-                self.inner.invite_details().await.ok().and_then(|a| a.inviter).map(|m| m.into())
-            })
+            self.inner.invite_details().await.ok().and_then(|a| a.inviter).map(|m| m.into())
         } else {
             None
         }
@@ -167,17 +176,50 @@ impl Room {
         }
     }
 
-    pub fn display_name(&self) -> Result<String, ClientError> {
-        let r = self.inner.clone();
-        RUNTIME.block_on(async move { Ok(r.display_name().await?.to_string()) })
+    /// Returns a timeline focused on the given event.
+    ///
+    /// Note: this timeline is independent from that returned with
+    /// [`Self::timeline`], and as such it is not cached.
+    pub async fn timeline_focused_on_event(
+        &self,
+        event_id: String,
+        num_context_events: u16,
+        internal_id_prefix: Option<String>,
+    ) -> Result<Arc<Timeline>, FocusEventError> {
+        let parsed_event_id = EventId::parse(&event_id).map_err(|err| {
+            FocusEventError::InvalidEventId { event_id: event_id.clone(), err: err.to_string() }
+        })?;
+
+        let room = &self.inner;
+
+        let mut builder = matrix_sdk_ui::timeline::Timeline::builder(room);
+
+        if let Some(internal_id_prefix) = internal_id_prefix {
+            builder = builder.with_internal_id_prefix(internal_id_prefix);
+        }
+
+        let timeline = match builder
+            .with_focus(TimelineFocus::Event { target: parsed_event_id, num_context_events })
+            .build()
+            .await
+        {
+            Ok(t) => t,
+            Err(err) => {
+                if let matrix_sdk_ui::timeline::Error::PaginationError(
+                    PaginationError::Paginator(PaginatorError::EventNotFound(..)),
+                ) = err
+                {
+                    return Err(FocusEventError::EventNotFound { event_id: event_id.to_string() });
+                }
+                return Err(FocusEventError::Other { msg: err.to_string() });
+            }
+        };
+
+        Ok(Timeline::new(timeline))
     }
 
     pub fn is_encrypted(&self) -> Result<bool, ClientError> {
-        let room = self.inner.clone();
-        RUNTIME.block_on(async move {
-            let is_encrypted = room.is_encrypted().await?;
-            Ok(is_encrypted)
-        })
+        Ok(RUNTIME.block_on(self.inner.is_encrypted())?)
     }
 
     pub async fn members(&self) -> Result<Arc<RoomMembersIterator>, ClientError> {
@@ -192,33 +234,28 @@ impl Room {
 
     pub async fn member(&self, user_id: String) -> Result<RoomMember, ClientError> {
         let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
-        let member = self.inner.get_member(&user_id).await?.context("No user found")?;
+        let member = self.inner.get_member(&user_id).await?.context("User not found")?;
         Ok(member.into())
     }
 
-    pub fn member_avatar_url(&self, user_id: String) -> Result<Option<String>, ClientError> {
-        let room = self.inner.clone();
-        RUNTIME.block_on(async move {
-            let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
-            let member = room.get_member(&user_id).await?.context("No user found")?;
-            let avatar_url_string = member.avatar_url().map(|m| m.to_string());
-            Ok(avatar_url_string)
-        })
+    pub async fn member_avatar_url(&self, user_id: String) -> Result<Option<String>, ClientError> {
+        let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
+        let member = self.inner.get_member(&user_id).await?.context("User not found")?;
+        let avatar_url_string = member.avatar_url().map(|m| m.to_string());
+        Ok(avatar_url_string)
     }
 
-    pub fn member_display_name(&self, user_id: String) -> Result<Option<String>, ClientError> {
-        let room = self.inner.clone();
-        RUNTIME.block_on(async move {
-            let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
-            let member = room.get_member(&user_id).await?.context("No user found")?;
-            let avatar_url_string = member.display_name().map(|m| m.to_owned());
-            Ok(avatar_url_string)
-        })
+    pub async fn member_display_name(
+        &self,
+        user_id: String,
+    ) -> Result<Option<String>, ClientError> {
+        let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
+        let member = self.inner.get_member(&user_id).await?.context("User not found")?;
+        let avatar_url_string = member.display_name().map(|m| m.to_owned());
+        Ok(avatar_url_string)
     }
 
     pub async fn room_info(&self) -> Result<RoomInfo, ClientError> {
-        let avatar_url = self.inner.avatar_url();
-
         // Look for a local event in the `Timeline`.
         //
         // First off, let's see if a `Timeline` exists…
@@ -229,7 +266,6 @@ impl Room {
                 if timeline_last_event.is_local_echo() {
                     return Ok(RoomInfo::new(
                         &self.inner,
-                        avatar_url,
                         Some(Arc::new(EventTimelineItem(timeline_last_event))),
                     )
                     .await?);
@@ -237,7 +273,8 @@ impl Room {
             }
         }
 
-        // Otherwise, fallback to the classical path.
+        // Otherwise, create a synthetic [`EventTimelineItem`] using the classical
+        // [`Room`] path.
         let latest_event = match self.inner.latest_event() {
             Some(latest_event) => matrix_sdk_ui::timeline::EventTimelineItem::from_latest_event(
                 self.inner.client(),
@@ -249,7 +286,8 @@ impl Room {
             .map(Arc::new),
             None => None,
         };
-        Ok(RoomInfo::new(&self.inner, avatar_url, latest_event).await?)
+
+        Ok(RoomInfo::new(&self.inner, latest_event).await?)
     }
 
     pub fn subscribe_to_room_info_updates(
@@ -295,12 +333,14 @@ impl Room {
     ///
     /// * `reason` - The reason for the event being redacted (optional).
     /// its transaction ID (optional). If not given one is created.
-    pub fn redact(&self, event_id: String, reason: Option<String>) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            let event_id = EventId::parse(event_id)?;
-            self.inner.redact(&event_id, reason.as_deref(), None).await?;
-            Ok(())
-        })
+    pub async fn redact(
+        &self,
+        event_id: String,
+        reason: Option<String>,
+    ) -> Result<(), ClientError> {
+        let event_id = EventId::parse(event_id)?;
+        self.inner.redact(&event_id, reason.as_deref(), None).await?;
+        Ok(())
     }
 
     pub fn active_members_count(&self) -> u64 {
@@ -325,29 +365,27 @@ impl Room {
     ///
     /// * `score` - The score to rate this content as where -100 is most
     ///   offensive and 0 is inoffensive (optional).
-    pub fn report_content(
+    pub async fn report_content(
         &self,
         event_id: String,
         score: Option<i32>,
         reason: Option<String>,
     ) -> Result<(), ClientError> {
+        let event_id = EventId::parse(event_id)?;
         let int_score = score.map(|value| value.into());
-        RUNTIME.block_on(async move {
-            let event_id = EventId::parse(event_id)?;
-            self.inner
-                .client()
-                .send(
-                    report_content::v3::Request::new(
-                        self.inner.room_id().into(),
-                        event_id,
-                        int_score,
-                        reason,
-                    ),
-                    None,
-                )
-                .await?;
-            Ok(())
-        })
+        self.inner
+            .client()
+            .send(
+                report_content::v3::Request::new(
+                    self.inner.room_id().into(),
+                    event_id,
+                    int_score,
+                    reason,
+                ),
+                None,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Ignores a user.
@@ -364,37 +402,29 @@ impl Room {
     /// Leave this room.
     ///
     /// Only invited and joined rooms can be left.
-    pub fn leave(&self) -> Result<(), ClientError> {
-        RUNTIME.block_on(async {
-            self.inner.leave().await?;
-            Ok(())
-        })
+    pub async fn leave(&self) -> Result<(), ClientError> {
+        self.inner.leave().await?;
+        Ok(())
     }
 
     /// Join this room.
     ///
     /// Only invited and left rooms can be joined via this method.
-    pub fn join(&self) -> Result<(), ClientError> {
-        RUNTIME.block_on(async {
-            self.inner.join().await?;
-            Ok(())
-        })
+    pub async fn join(&self) -> Result<(), ClientError> {
+        self.inner.join().await?;
+        Ok(())
     }
 
     /// Sets a new name to the room.
-    pub fn set_name(&self, name: String) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            self.inner.set_name(name).await?;
-            Ok(())
-        })
+    pub async fn set_name(&self, name: String) -> Result<(), ClientError> {
+        self.inner.set_name(name).await?;
+        Ok(())
     }
 
     /// Sets a new topic in the room.
-    pub fn set_topic(&self, topic: String) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            self.inner.set_room_topic(&topic).await?;
-            Ok(())
-        })
+    pub async fn set_topic(&self, topic: String) -> Result<(), ClientError> {
+        self.inner.set_room_topic(&topic).await?;
+        Ok(())
     }
 
     /// Upload and set the room's avatar.
@@ -410,43 +440,37 @@ impl Room {
     /// * `data` - The raw data that will be uploaded to the homeserver's
     ///   content repository
     /// * `media_info` - The media info used as avatar image info.
-    pub fn upload_avatar(
+    pub async fn upload_avatar(
         &self,
         mime_type: String,
         data: Vec<u8>,
         media_info: Option<ImageInfo>,
     ) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            let mime: Mime = mime_type.parse()?;
-            self.inner
-                .upload_avatar(
-                    &mime,
-                    data,
-                    media_info
-                        .map(TryInto::try_into)
-                        .transpose()
-                        .map_err(|_| RoomError::InvalidMediaInfo)?,
-                )
-                .await?;
-            Ok(())
-        })
+        let mime: Mime = mime_type.parse()?;
+        self.inner
+            .upload_avatar(
+                &mime,
+                data,
+                media_info
+                    .map(TryInto::try_into)
+                    .transpose()
+                    .map_err(|_| RoomError::InvalidMediaInfo)?,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Removes the current room avatar
-    pub fn remove_avatar(&self) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            self.inner.remove_avatar().await?;
-            Ok(())
-        })
+    pub async fn remove_avatar(&self) -> Result<(), ClientError> {
+        self.inner.remove_avatar().await?;
+        Ok(())
     }
 
-    pub fn invite_user_by_id(&self, user_id: String) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            let user = <&UserId>::try_from(user_id.as_str())
-                .context("Could not create user from string")?;
-            self.inner.invite_user_by_id(user).await?;
-            Ok(())
-        })
+    pub async fn invite_user_by_id(&self, user_id: String) -> Result<(), ClientError> {
+        let user =
+            <&UserId>::try_from(user_id.as_str()).context("Could not create user from string")?;
+        self.inner.invite_user_by_id(user).await?;
+        Ok(())
     }
 
     pub async fn can_user_redact_own(&self, user_id: String) -> Result<bool, ClientError> {
@@ -620,6 +644,15 @@ impl Room {
         let event_id = EventId::parse(event_id)?;
         Ok(self.inner.matrix_to_event_permalink(event_id).await?.to_string())
     }
+}
+
+/// Generates a `matrix.to` permalink to the given room alias.
+#[uniffi::export]
+pub fn matrix_to_room_alias_permalink(
+    room_alias: String,
+) -> std::result::Result<String, ClientError> {
+    let room_alias = RoomAliasId::parse(room_alias)?;
+    Ok(room_alias.matrix_to_uri().to_string())
 }
 
 #[derive(uniffi::Record)]

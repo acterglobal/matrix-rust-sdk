@@ -33,7 +33,7 @@ use ruma::{
         relation::InReplyTo,
         room::message::{
             MessageType, Relation, ReplacementMetadata, RoomMessageEventContent,
-            TextMessageEventContent,
+            RoomMessageEventContentWithoutRelation, TextMessageEventContent,
         },
     },
     room_id, user_id,
@@ -55,10 +55,10 @@ async fn test_edit() {
     let event_builder = EventBuilder::new();
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
-    let mut ev_builder = SyncResponseBuilder::new();
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -67,7 +67,7 @@ async fn test_edit() {
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
     let event_id = event_id!("$msda7m:localhost");
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
         event_builder.make_sync_message_event_with_id(
             &ALICE,
             event_id,
@@ -75,7 +75,7 @@ async fn test_edit() {
         ),
     ));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -90,7 +90,7 @@ async fn test_edit() {
     assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
     assert!(day_divider.is_day_divider());
 
-    ev_builder.add_joined_room(
+    sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
             .add_timeline_event(event_builder.make_sync_message_event(
                 &BOB,
@@ -107,7 +107,7 @@ async fn test_edit() {
             ),
     );
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -202,7 +202,7 @@ async fn test_send_edit() {
         .await;
 
     timeline
-        .edit(RoomMessageEventContent::text_plain("Hello, Room!"), &hello_world_item)
+        .edit(RoomMessageEventContentWithoutRelation::text_plain("Hello, Room!"), &hello_world_item)
         .await
         .unwrap();
 
@@ -288,7 +288,10 @@ async fn test_send_reply_edit() {
         .mount(&server)
         .await;
 
-    timeline.edit(RoomMessageEventContent::text_plain("Hello, Room!"), &reply_item).await.unwrap();
+    timeline
+        .edit(RoomMessageEventContentWithoutRelation::text_plain("Hello, Room!"), &reply_item)
+        .await
+        .unwrap();
 
     let edit_item =
         assert_next_matches!(timeline_stream, VectorDiff::Set { index: 1, value } => value);

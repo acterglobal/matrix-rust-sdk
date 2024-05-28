@@ -29,9 +29,7 @@ use matrix_sdk::{
 use matrix_sdk_ui::{
     room_list_service,
     sync_service::{self, SyncService},
-    timeline::{
-        PaginationOptions, TimelineItem, TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
-    },
+    timeline::{TimelineItem, TimelineItemContent, TimelineItemKind, VirtualTimelineItem},
     Timeline as SdkTimeline,
 };
 use ratatui::{prelude::*, style::palette::tailwind, widgets::*};
@@ -52,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(tracing_appender::rolling::hourly("/tmp/", "logs-"));
 
     tracing_subscriber::registry()
-        .with(EnvFilter::new(std::env::var("RUST_LOG").unwrap_or("".into())))
+        .with(EnvFilter::new(env::var("RUST_LOG").unwrap_or("".into())))
         .with(file_layer)
         .init();
 
@@ -110,8 +108,8 @@ struct StatefulList<T> {
 
 #[derive(Default, PartialEq)]
 enum DetailsMode {
-    #[default]
     ReadReceipts,
+    #[default]
     TimelineItems,
     // Events // TODO: Soon™
 }
@@ -343,9 +341,7 @@ impl App {
         // Start a new one, request batches of 20 events, stop after 10 timeline items
         // have been added.
         *pagination = Some(spawn(async move {
-            if let Err(err) =
-                sdk_timeline.paginate_backwards(PaginationOptions::until_num_items(20, 10)).await
-            {
+            if let Err(err) = sdk_timeline.live_paginate_backwards(20).await {
                 // TODO: would be nice to be able to set the status
                 // message remotely?
                 //self.set_status_message(format!(
@@ -389,7 +385,7 @@ impl App {
         loop {
             terminal.draw(|f| f.render_widget(&mut *self, f.size()))?;
 
-            if crossterm::event::poll(Duration::from_millis(16))? {
+            if event::poll(Duration::from_millis(16))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         use KeyCode::*;
@@ -807,7 +803,7 @@ async fn configure_client(server_name: String, config_path: String) -> anyhow::R
             auto_enable_backups: true,
         });
 
-    if let Ok(proxy_url) = std::env::var("PROXY") {
+    if let Ok(proxy_url) = env::var("PROXY") {
         client_builder = client_builder.proxy(proxy_url).disable_ssl_verification();
     }
 
