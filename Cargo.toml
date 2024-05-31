@@ -40,7 +40,7 @@ http = "1.1.0"
 imbl = "2.0.0"
 itertools = "0.12.0"
 reqwest = { version = "0.12.4", default-features = false }
-ruma = { git = "https://github.com/acterglobal/ruma", rev = "1045473792509c4cbe271bf0c450727e6d848820", features = [
+ruma = { git = "https://github.com/acterglobal/ruma", rev = "c74a4dcc4ff6406288bbf83fa7475dc732fe3a5e", features = [
     "client-api-c",
     "compat-upload-signatures",
     "compat-user-id",
@@ -49,7 +49,7 @@ ruma = { git = "https://github.com/acterglobal/ruma", rev = "1045473792509c4cbe2
     "unstable-msc3401",
     "unstable-msc3266",
 ] }
-ruma-common = { git = "https://github.com/acterglobal/ruma", rev = "1045473792509c4cbe271bf0c450727e6d848820" }
+ruma-common = { git = "https://github.com/acterglobal/ruma", rev = "c74a4dcc4ff6406288bbf83fa7475dc732fe3a5e" }
 once_cell = "1.16.0"
 rand = "0.8.5"
 serde = "1.0.151"
